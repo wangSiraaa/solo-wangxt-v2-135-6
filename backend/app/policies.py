@@ -201,6 +201,7 @@ class NearestPolicy(_AssignedPolicy):
 
     def on_tick(self, b: Building) -> None:
         # 先释放失效认领
+        now = b.env.now
         for call in b.active_calls():
             if call.claimed_by is not None:
                 owner = b.cars[call.claimed_by]
@@ -212,11 +213,20 @@ class NearestPolicy(_AssignedPolicy):
                                queue_len=len(call.queue))
                         call.claimed_by = None
                         call.assign_time = None
+                elif b.car_unavailable(owner, now):
+                    # 阻挡武装/执行：该车不再应答新呼叫，认领交回重派
+                    b.log(b.env.now, "call_release", floor=call.floor,
+                           dir=call.direction, car=owner.id,
+                           reason="blocked", queue_len=len(call.queue))
+                    call.claimed_by = None
+                    call.assign_time = None
 
         # 空闲（或空载）轿厢主动补位：把剩余队列最长的呼叫指给最近的空车，
         # 使大堂式长队列可由多梯并发响应（标准 ETA 调度的并发语义）
+        # 阻挡武装/执行中的轿厢不参与新指派（门要保持打开、不可移动）
         idle_cars = [c for c in b.cars
-                     if len(c.aboard) == 0 and c.dir == IDLE]
+                     if len(c.aboard) == 0 and c.dir == IDLE
+                     and not b.car_unavailable(c, now)]
         for car in sorted(idle_cars, key=lambda c: c.id):
             options = []
             for call in b.active_calls():
@@ -294,7 +304,7 @@ class NearestPolicy(_AssignedPolicy):
                 + 3 * b.door_time + load_penalty)
 
     def _best_car(self, b: Building, call: HallCall) -> Car | None:
-        candidates = list(b.cars)  # 满载车也可参与（前瞻），但 ETA 惩罚更高
+        candidates = [c for c in b.cars if not b.car_unavailable(c, b.env.now)]
         if not candidates:
             return None
         candidates.sort(key=lambda c: (self._eta(b, c, call.floor), c.id))
@@ -326,13 +336,23 @@ class ZoningPolicy(_AssignedPolicy):
         return None
 
     def on_tick(self, b: Building) -> None:
+        now = b.env.now
         for call in b.active_calls():
             if call.claimed_by is not None:
                 owner = b.cars[call.claimed_by]
+                if b.car_unavailable(owner, now):
+                    # 阻挡武装/执行：本区车的认领交回（由其他车或解除后承接）
+                    b.log(b.env.now, "call_release", floor=call.floor,
+                           dir=call.direction, car=owner.id,
+                           reason="blocked", queue_len=len(call.queue))
+                    call.claimed_by = None
+                    call.assign_time = None
+                    continue
                 if len(owner.aboard) >= b.capacity:
                     ahead = (call.floor - owner.floor) * owner.dir > 0
                     helpers = [c for c in b.cars
-                               if c.id != owner.id and len(c.aboard) < b.capacity]
+                               if c.id != owner.id and len(c.aboard) < b.capacity
+                               and not b.car_unavailable(c, now)]
                     if not ahead and helpers:
                         b.log(b.env.now, "call_release", floor=call.floor,
                                dir=call.direction, car=owner.id, reason="full",
@@ -343,11 +363,13 @@ class ZoningPolicy(_AssignedPolicy):
                 continue
             owner = self._zone_of(b, call.floor)
             chosen: Car | None = None
-            if owner is not None and len(b.cars[owner].aboard) < b.capacity:
+            if owner is not None and len(b.cars[owner].aboard) < b.capacity \
+                    and not b.car_unavailable(b.cars[owner], now):
                 chosen = b.cars[owner]
             if chosen is None:
-                # 本区车满载：未满员车越区支援，近者优先
-                free = [c for c in b.cars if len(c.aboard) < b.capacity]
+                # 本区车满载或被阻挡：未满员、未阻挡车越区支援，近者优先
+                free = [c for c in b.cars if len(c.aboard) < b.capacity
+                        and not b.car_unavailable(c, now)]
                 free.sort(key=lambda c: (abs(c.floor - call.floor), c.id))
                 chosen = free[0] if free else None
             if chosen is not None:

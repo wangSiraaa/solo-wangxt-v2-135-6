@@ -158,6 +158,8 @@ def test_verifier_detects_overload():
         ev.append({"t": 0, "type": "pax_arrive", "pid": pid, "origin": 1,
                    "dest": 5, "wanted": 1, "location": "hall:1"})
     ev.append({"t": 0, "type": "car_move", "car": 0, "floor": 1, "dir": 1})
+    ev.append({"t": 1, "type": "doors_open", "car": 0, "floor": 1,
+               "load": 0, "door_time": 1})
     for pid in range(9):
         ev.append({"t": 1, "type": "pax_board", "pid": pid, "car": 0,
                    "floor": 1, "dest": 5, "wanted": 1,

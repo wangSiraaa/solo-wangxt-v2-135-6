@@ -5,7 +5,7 @@ import json
 import os
 
 from sqlalchemy import (
-    create_engine, String, Integer, Float, Text, DateTime, func,
+    create_engine, String, Integer, Float, Text, DateTime, func, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 
@@ -33,7 +33,7 @@ class Base(DeclarativeBase):
 
 class Scenario(Base):
     __tablename__ = "scenarios"
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
     case: Mapped[str] = mapped_column(String(32))
     label: Mapped[str] = mapped_column(String(128))
     floors: Mapped[int] = mapped_column(Integer)
@@ -46,18 +46,22 @@ class Scenario(Base):
     duration: Mapped[float] = mapped_column(Float)
     until: Mapped[float] = mapped_column(Float)
     demand: Mapped[int] = mapped_column(Integer, default=0)
+    blocks_json: Mapped[str] = mapped_column(Text, default="[]")
 
 
 class Run(Base):
     __tablename__ = "runs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    scenario_id: Mapped[str] = mapped_column(String(64), index=True)
+    scenario_id: Mapped[str] = mapped_column(String(128), index=True)
     policy: Mapped[str] = mapped_column(String(32), index=True)
     seed: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[str] = mapped_column(DateTime(timezone=True),
                                            server_default=func.now())
     metrics_json: Mapped[str] = mapped_column(Text)
     verification_json: Mapped[str] = mapped_column(Text, default="{}")
+    blocks_json: Mapped[str] = mapped_column(Text, default="[]")
+    blocked: Mapped[int] = mapped_column(Integer, default=0)
+    baseline_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     served: Mapped[int] = mapped_column(Integer)
     unserved: Mapped[int] = mapped_column(Integer)
     completion_rate: Mapped[float] = mapped_column(Float)
@@ -95,16 +99,31 @@ class EventLog(Base):
 
 
 def init_db() -> None:
-    Base.metadata.create_all(get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    # 旧库平滑升级：幂等补齐阻挡相关列（刷新已保存运行需要它们）
+    with engine.begin() as conn:
+        for stmt in (
+            "ALTER TABLE scenarios ADD COLUMN IF NOT EXISTS blocks_json TEXT DEFAULT '[]'",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS blocks_json TEXT DEFAULT '[]'",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS blocked INTEGER DEFAULT 0",
+            "ALTER TABLE runs ADD COLUMN IF NOT EXISTS baseline_run_id INTEGER",
+        ):
+            conn.execute(text(stmt))
 
 
 def save_run(session: Session, *, scenario_id: str, policy: str, seed: int,
              metrics: dict, verification: dict,
-             pax_rows: list[dict], events: list[dict]) -> int:
+             pax_rows: list[dict], events: list[dict],
+             blocks: list[dict] | None = None, blocked: bool = False,
+             baseline_run_id: int | None = None) -> int:
     run = Run(
         scenario_id=scenario_id, policy=policy, seed=seed,
         metrics_json=json.dumps(metrics, ensure_ascii=False),
         verification_json=json.dumps(verification, ensure_ascii=False),
+        blocks_json=json.dumps(blocks or [], ensure_ascii=False),
+        blocked=1 if blocked else 0,
+        baseline_run_id=baseline_run_id,
         served=metrics["served"], unserved=metrics["unserved"],
         completion_rate=metrics["completion_rate"],
         wait_mean_all=metrics["all_pax"]["wait_mean"],

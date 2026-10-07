@@ -18,13 +18,21 @@ export const EVENT_TYPES = {
   support: 'call_support',
   skip: 'car_skip',
   unserved: 'pax_unserved',
+  blockArm: 'door_block_arm',
+  blockStart: 'door_block_start',
+  blockEnd: 'door_block_end',
+  blockSkip: 'door_block_skip_expired',
 }
 
 // 生成离散关键帧（每条事件一帧）。返回帧序列，每帧是世界快照。
 export function buildFrames(events, { floors, carCount, capacity }) {
   const cars = []
   for (let i = 0; i < carCount; i++) {
-    cars.push({ id: i, floor: 1, dir: 0, doors: 'closed', load: 0, dests: [] })
+    cars.push({
+      id: i, floor: 1, dir: 0, doors: 'closed', load: 0, dests: [],
+      blocked: null,       // null | {blockId, start, end, attached}
+      blockArmed: null,    // 已武装尚未进入保持的阻挡
+    })
   }
   // 乘客状态：pid -> {pid, origin, dest, wanted, location, car, floor, status}
   const pax = new Map()
@@ -33,6 +41,9 @@ export function buildFrames(events, { floors, carCount, capacity }) {
   for (let f = 1; f <= floors; f++) halls[f] = { up: [], down: [] }
   const assignments = {} // `${floor}:${dir}` -> carId
   const supports = {}    // `${floor}:${dir}` -> Set(carId)
+  // 阻挡区间（供时间轴显示）：{blockId, car, floor, start, end, enterT, attached}
+  const blockages = []
+  const blockById = new Map()
 
   const snapshot = (t) => ({
     t,
@@ -42,6 +53,7 @@ export function buildFrames(events, { floors, carCount, capacity }) {
     pax: new Map(pax),
     assignments: { ...assignments },
     supports: Object.fromEntries(Object.entries(supports).map(([k, v]) => [k, new Set(v)])),
+    blockages: blockages.map(b => ({ ...b })),
   })
 
   const frames = [snapshot(0)]
@@ -120,7 +132,7 @@ export function buildFrames(events, { floors, carCount, capacity }) {
         const c = cars[e.car]
         c.load = e.load
         // 到达该层后清除内呼
-        if (c.load === 0 || !pax.values().some(
+        if (c.load === 0 || ![...pax.values()].some(
           x => x.location === 'car' && x.car === c.id && x.dest === e.floor)) {
           c.dests = c.dests.filter(d => d !== e.floor)
         }
@@ -157,13 +169,54 @@ export function buildFrames(events, { floors, carCount, capacity }) {
         counts.unserved++
         break
       }
+      case EVENT_TYPES.blockArm: {
+        const c = cars[e.car]
+        c.blockArmed = {
+          blockId: e.block_id, start: e.start, end: e.end,
+          requestedFloor: e.requested_floor,
+        }
+        break
+      }
+      case EVENT_TYPES.blockStart: {
+        const c = cars[e.car]
+        const info = {
+          blockId: e.block_id, start: e.start, end: e.end,
+          floor: e.floor, requestedFloor: e.requested_floor,
+          enterT: e.t, attached: !!e.attached,
+          boardedPids: e.boarded_pids || [],
+          strandedPids: e.stranded_pids || [],
+        }
+        c.blocked = info
+        c.blockArmed = null
+        c.doors = 'open'
+        blockById.set(e.block_id, info)
+        blockages.push(info)
+        break
+      }
+      case EVENT_TYPES.blockEnd: {
+        const c = cars[e.car]
+        const info = blockById.get(e.block_id)
+        if (info) {
+          info.releaseT = e.t
+          info.aboardPids = e.aboard_pids || []
+          info.strandedPids = e.stranded_pids || []
+        }
+        c.blocked = null
+        // doors 状态由紧随其后的 doors_close 事件置为 closed
+        break
+      }
+      case EVENT_TYPES.blockSkip: {
+        const c = cars[e.car]
+        c.blockArmed = null
+        break
+      }
       default:
         break
     }
     frames.push(snapshot(e.t))
   }
 
-  return { frames, counts }
+  return { frames, counts, blockages }
 }
 
 // 从帧序列中重建单个乘客的位置迁移链（供"乘客轨迹核对"面板）

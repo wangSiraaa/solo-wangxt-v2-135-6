@@ -87,10 +87,44 @@ export DATABASE_URL="postgresql+psycopg2://USER:PASS@HOST:5432/elevator_lab"
 一辆车而严重积压；均衡混流下集选简单且有效；长开门放大停站代价，nearest 因减少
 重复停站使总行程反超，但静态分区在压力下最先出现未服务乘客。
 
+## 门保持打开（乘客挡门）事件
+
+评估高峰期一台轿厢的门被乘客短暂挡住对整体候梯的影响。在前端配置或通过
+`POST /api/simulate` 的 `blocks` 字段指定**若干个**事件：
+
+```json
+"blocks": [{"car": 0, "floor": 4, "start": 200, "end": 280}]
+```
+
+- 语义：`start` 时刻**武装**指定轿厢（记录 `door_block_arm`）：关门逐层就位到
+  指定楼层（门已在该层正常停站则不重开、不重复登乘，直接续接保持），执行一次
+  与普通停站相同的开门—先下后上（一批 FIFO 登乘），随后记录
+  **`door_block_start`**；到 `end` 记录 **`door_block_end`** 并关门。
+- **保持期间**（start→end）该轿厢不能移动、不能重复登乘（新到乘客留在候梯队列）、
+  车内乘客位置不变；**其他轿厢完全不受影响**，继续按各自策略运行，
+  nearest/zoning 会把被挡轿厢持有的呼叫释放并派给其他轿厢。
+- 若 start 落在一层移动中途，当前这层移动走完再就位，**不回退、不跳层**；
+  配置楼层与实际楼层不符时在实际层执行并产生校验告警（在无阻挡重放时间轴上
+  取点配置可保证吻合：start 之前仿真与无阻挡完全一致）。
+- `compare_baseline=true`（默认）时每个策略额外跑一次**无阻挡对照**，
+  与阻挡运行、三种策略共用**同一份到达序列**（同种子，只生成一次乘客），
+  返回 `baselines / baseline_comparison / deltas`，指标同时给出
+  **受影响乘客子口径**（保持期间滞留阻挡楼层的人 + 门开时车内被延后的人）
+  与**全客流口径**，两者并列、互不替换。
+- 前端时间轴以红色斜纹段显示阻挡区间（点击跳转到阻挡开始帧），被挡轿厢红色
+  脉冲描边、方向符变 ✋；可在"阻挡运行 / 无阻挡对照"间切换重放。
+- 阻挡配置随 run 持久化（`runs.blocks_json / blocked / baseline_run_id`、
+  `scenarios.blocks_json`），刷新后从事件日志确定性重放出相同的阻挡状态与指标。
+
+相关实现：`blockages.py`（配置校验）、`engine.py`（武装/就位/保持/解除过程）、
+`verifier.py`（保持期间禁动/禁关门/禁重复登乘、位置不跳变硬校验）。
+
 ## 事件日志与物理不变量
 
 每次仿真输出带时间戳的事件流：`pax_arrive / call_assign / car_dir / car_move /
-doors_open / pax_board / car_full / pax_alight / doors_close / pax_unserved`。
+doors_open / pax_board / car_full / pax_alight / doors_close / pax_unserved`，
+阻挡运行额外有 `door_block_arm / door_block_start / door_block_end`
+（就位移动带 `blocked_relocating`，超时未执行有 `door_block_skip_expired`）。
 
 `verifier.py` 逐事件重建世界并硬校验：
 
@@ -99,7 +133,10 @@ doors_open / pax_board / car_full / pax_alight / doors_close / pax_unserved`。
 3. 任何上车事件后车内人数 ≤ 容量；
 4. 轿厢每次只移动一层、不越出井道、开门时不移动；
 5. 状态链 `arrive → board → alight` 每人至多一次，无重复服务/凭空消失；
-6. 日志完成人数与乘客表、指标一致（伪造日志会被测试抓住）。
+6. 日志完成人数与乘客表、指标一致（伪造日志会被测试抓住）；
+7. 阻挡保持期间轿厢不移动、不关门、登乘只发生在保持开始前的一批，
+   武装后只允许朝目标层逐层就位，每个配置阻挡必须有开始与解除、
+   解除时刻严格等于配置 `end`、保持期间楼层不变。
 
 ## 测试
 
@@ -110,22 +147,27 @@ python3 -m pytest tests/ -q
 
 覆盖：三策略 × 两案例的不变量、同种子可复现、满载留客、未服务计入指标、
 候梯/乘梯/总行程分解、单人位置链、伪造日志检测、逐层移动、API 端到端
-（同一客流多策略、长开门与跨层客流一致性）。
+（同一客流多策略、长开门与跨层客流一致性），以及 `test_blockages.py`：
+阻挡禁动/禁重复登乘/位置不跳变、其他轿厢继续运行、有/无阻挡同客流、
+解除后服务继续、同层开门续接只有一批登乘、可复现、配置校验、
+伪造阻挡日志检测、API 有/无阻挡端到端与已保存运行重放。
 
 ## 目录结构
 
 ```
 backend/app/
-  engine.py     SimPy 物理引擎（移动/开关门/先下后上/FIFO/容量/指标）
-  policies.py   collective / nearest / zoning 三个策略
+  engine.py     SimPy 物理引擎（移动/开关门/先下后上/FIFO/容量/指标/阻挡过程）
+  blockages.py  门保持打开事件配置与校验（指定轿厢/楼层/时间窗）
+  policies.py   collective / nearest / zoning 三个策略（阻挡车不参与新指派）
   demand.py     早高峰、跨层、长开门客流（泊松到达，种子可复现）
   models.py     Pax / HallCall / 状态枚举
-  verifier.py   事件日志物理不变量校验
-  database.py   PostgreSQL 表与持久化
+  verifier.py   事件日志物理不变量校验（含阻挡禁动/禁重复登乘）
+  database.py   PostgreSQL 表与持久化（含阻挡配置与对照 run 关联）
   runner.py     组装一次仿真
-  main.py       FastAPI：/api/simulate、/api/runs、/api/runs/{id}/events
+  main.py       FastAPI：/api/simulate（有/无阻挡同客流）、/api/runs、events
 frontend/src/
-  engine/replay.js  事件日志 → 逐帧世界快照（确定性，无随机）
+  engine/replay.js  事件日志 → 逐帧世界快照（确定性，无随机，含阻挡状态）
   components/       Shaft / MetricsTable / PassengerAudit
+  App.jsx           阻挡配置、阻挡时间轴、有/无阻挡对照切换
 scripts/        setup.sh、start.sh
 ```

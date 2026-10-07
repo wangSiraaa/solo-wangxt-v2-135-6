@@ -23,7 +23,8 @@ class VerificationError(Exception):
 
 
 def verify(events: list[dict], pax_records: list[dict],
-           capacity: int, floors: int, until: float) -> list[str]:
+           capacity: int, floors: int, until: float,
+           blocks: list | None = None) -> list[str]:
     """返回告警列表；发现违反硬不变量时抛 VerificationError。"""
     warnings: list[str] = []
 
@@ -35,7 +36,17 @@ def verify(events: list[dict], pax_records: list[dict],
     car_load: dict[int, int] = defaultdict(int)
     car_floor: dict[int, int] = {}
     car_door_open: dict[int, bool] = defaultdict(bool)
+    # 阻挡：armed[car]=block_id（已武装，允许关门逐层就位移动）；
+    # holding[car]=(end_t, floor)（door_block_start→end，门开着，禁动禁登乘禁关门）
+    armed: dict[int, tuple] = {}
+    relocating: dict[int, int] = {}   # car -> 请求楼层
+    midflight: set[int] = set()       # 武装前已启动的一层移动（仅放行一段）
+    started: set[tuple] = set()       # (block_id, car) 已记 door_block_start
+    holding: dict[int, tuple[float, int]] = {}
     last_t = -1.0
+
+    def _bkey(e: dict) -> tuple:
+        return (e.get("block_id"), e.get("car"))
 
     for e in events:
         t = e["t"]
@@ -67,6 +78,12 @@ def verify(events: list[dict], pax_records: list[dict],
             if car_floor.get(car) != e["floor"]:
                 raise VerificationError(
                     f"乘客 {pid} 上 {car} 号梯时轿厢不在 {e['floor']} 层")
+            if not car_door_open[car]:
+                raise VerificationError(
+                    f"乘客 {pid} 在 {car} 号梯关门状态下登乘")
+            if car in holding:
+                raise VerificationError(
+                    f"乘客 {pid} 在 {car} 号梯门保持打开（阻挡）期间重复登乘")
             # 方向约束：轿厢扫描方向必须把乘客送往目的层
             if not ((e["dest"] - e["floor"]) * e.get("wanted", 0) > 0):
                 raise VerificationError(f"乘客 {pid} 外呼方向与目的层矛盾")
@@ -107,6 +124,28 @@ def verify(events: list[dict], pax_records: list[dict],
                 raise VerificationError(f"{car} 号梯越出井道: {e['floor']}")
             if car_door_open[car]:
                 raise VerificationError(f"{car} 号梯开门状态下移动")
+            if car in holding:
+                raise VerificationError(
+                    f"{car} 号梯在阻挡保持（门保持打开）期间移动")
+            if car in armed:
+                # 武装后到 door_block_start 前，只允许朝目标层的就位移动
+                if not e.get("blocked_relocating"):
+                    raise VerificationError(
+                        f"{car} 号梯武装阻挡后执行了非就位移动")
+                if not e.get("armed_mid_move"):
+                    target = relocating[car]
+                    if (target - e["floor"]) * e.get("dir", 0) < 0:
+                        raise VerificationError(
+                            f"{car} 号梯阻挡就位移动偏离目标层 {target}")
+                else:
+                    # 武装前已启动的那一层移动：整段仿真只允许一次
+                    if car in midflight:
+                        raise VerificationError(
+                            f"{car} 号梯武装后的飞行中移动多于一次")
+                    midflight.add(car)
+            elif e.get("blocked_relocating"):
+                raise VerificationError(
+                    f"{car} 号梯出现未武装的阻挡就位移动")
             car_floor[car] = e["floor"]
 
         elif typ == "doors_open":
@@ -117,7 +156,76 @@ def verify(events: list[dict], pax_records: list[dict],
             car_door_open[car] = True
 
         elif typ == "doors_close":
-            car_door_open[e["car"]] = False
+            car = e["car"]
+            if car in holding:
+                raise VerificationError(
+                    f"{car} 号梯在阻挡解除（door_block_end）前关门")
+            car_door_open[car] = False
+
+        elif typ == "door_block_arm":
+            car = e["car"]
+            if car in armed or car in holding:
+                raise VerificationError(
+                    f"{car} 号梯在已有阻挡未结束时再次武装")
+            car_floor.setdefault(car, e["floor"])
+            if car_floor[car] != e["floor"]:
+                raise VerificationError(f"阻挡武装时 {car} 号梯楼层不一致")
+            # 开门期间武装允许两种续接：同层则门不关直接续接保持；
+            # 不同层则当前停站正常关门后逐层就位（door_block_start 前
+            # 必然已有 doors_close，由"开门不动"校验兜底）
+            armed[car] = _bkey(e)
+            relocating[car] = e["requested_floor"]
+
+        elif typ == "door_block_start":
+            car = e["car"]
+            key = _bkey(e)
+            if car not in armed:
+                raise VerificationError(
+                    f"{car} 号梯 door_block_start 未先武装")
+            if key in started or car in holding:
+                raise VerificationError(f"阻挡 {key} 重复开始")
+            if car_floor.get(car) != e["floor"]:
+                raise VerificationError(
+                    f"阻挡开始时 {car} 号梯不在 {e['floor']} 层")
+            if not car_door_open[car]:
+                raise VerificationError(
+                    f"阻挡开始时 {car} 号梯门未打开")
+            if relocating.get(car) != e["floor"]:
+                warnings.append(
+                    f"阻挡事件 {e.get('block_id')} 配置楼层"
+                    f" {e.get('requested_floor')} 与轿厢实际楼层"
+                    f" {e['floor']} 不一致（未发生跳变，已在实际层执行）")
+            started.add(key)
+            holding[car] = (e["end"], e["floor"])
+            armed.pop(car, None)
+
+        elif typ == "door_block_end":
+            car = e["car"]
+            if car not in holding:
+                raise VerificationError(
+                    f"{car} 号梯 door_block_end 无对应的 door_block_start")
+            end_t, hold_floor = holding.pop(car)
+            relocating.pop(car, None)
+            midflight.discard(car)
+            if car_floor.get(car) != e["floor"] or e["floor"] != hold_floor:
+                raise VerificationError(
+                    f"阻挡期间 {car} 号梯楼层发生变化：{hold_floor} → {e['floor']}")
+            if not car_door_open[car]:
+                raise VerificationError(
+                    f"阻挡解除时 {car} 号梯门未处于打开状态")
+            if abs(e["t"] - end_t) > 1e-6:
+                raise VerificationError(
+                    f"阻挡解除时刻 {e['t']} ≠ 配置 end {end_t}")
+            # 紧随其后的 doors_close 在上面的分支校验（门仍开 → 合法关闭）
+
+        elif typ == "door_block_skip_expired":
+            car = e["car"]
+            if car not in armed:
+                raise VerificationError(
+                    f"{car} 号梯 door_block_skip_expired 未先武装")
+            armed.pop(car, None)
+            relocating.pop(car, None)
+            midflight.discard(car)
 
         elif typ == "pax_unserved":
             # 仿真结束快照：位置必须仍是候梯厅或轿厢
@@ -153,6 +261,25 @@ def verify(events: list[dict], pax_records: list[dict],
     for cid, n in car_load.items():
         if n < 0:
             raise VerificationError(f"{cid} 号梯终态车内人数为负")
+
+    # 所有已武装/保持中的阻挡必须有解除（否则轿厢会停在阻挡态直到截止）
+    if armed:
+        raise VerificationError(f"阻挡武装后无开始/解除事件: {armed}")
+    if holding:
+        raise VerificationError(f"阻挡开始后无 door_block_end: {holding}")
+
+    # 配置的阻挡必须逐一在日志中出现（开始 + 解除）
+    if blocks:
+        for i, b in enumerate(blocks):
+            bid = b.get("block_id", i) if isinstance(b, dict) \
+                else getattr(b, "block_id", i)
+            if not any(k[0] == bid for k in started):
+                raise VerificationError(
+                    f"配置的阻挡事件 {bid} 未在事件日志中执行（不可静默丢弃）")
+            floor = b.get("floor") if isinstance(b, dict) else b.floor
+            if not (1 <= floor <= floors):
+                raise VerificationError(f"阻挡事件 {bid} 楼层越界")
+
     if events and events[-1]["t"] > until + 1e-6:
         warnings.append("存在晚于仿真截止时刻的事件")
     return warnings

@@ -81,3 +81,65 @@ def test_bad_policy_rejected():
                     json={"case": "cross_floor", "policies": ["nope"],
                           "persist": False})
     assert r.status_code == 400
+
+
+def test_block_same_flow_with_baseline():
+    """阻挡运行 + 无阻挡对照：同一份到达序列，事件含开始/解除，指标含受影响口径。"""
+    body = {
+        "case": "cross_floor", "floors": 10, "car_count": 2,
+        "capacity": 6, "seed": 5, "rate_per_min": 9, "duration": 600,
+        "until": 1500, "persist": False,
+        "policies": ["nearest"],
+        "blocks": [{"car": 0, "floor": 4, "start": 200, "end": 280}],
+        "compare_baseline": True,
+    }
+    r = client.post("/api/simulate", json=body)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # 同一份客流：对照与阻挡的到达序列逐元素相同（未重新生成乘客）
+    assert data["arrivals"]
+    blk = data["results"][0]
+    base = data["baselines"][0]
+    assert base["metrics"]["demand"] == blk["metrics"]["demand"]
+    types_ = [e["type"] for e in blk["events"]]
+    assert {"door_block_arm", "door_block_start", "door_block_end"} <= set(types_)
+    # 阻挡期间无 0 号梯移动/登乘/关门
+    ev = blk["events"]
+    s = next(i for i, e in enumerate(ev) if e["type"] == "door_block_start")
+    en = next(i for i, e in enumerate(ev) if e["type"] == "door_block_end")
+    for e in ev[s + 1:en]:
+        if e.get("car") == 0:
+            assert e["type"] not in ("car_move", "pax_board", "doors_close")
+    # 其他轿厢在阻挡期间继续运行
+    assert any(e["type"] == "car_move" and e.get("car") == 1
+               for e in ev[s:en])
+    # 受影响乘客口径 + 全客流变化
+    bg = blk["metrics"]["blockages"]
+    assert bg["affected_count"] >= 0 and "affected_metrics" in bg
+    assert data["deltas"]["rows"]["nearest"]["wait_mean_all_delta"] is not None
+    assert blk["verification"]["ok"]
+    assert blk["blocks"][0]["start"] == 200 and blk["blocks"][0]["end"] == 280
+
+
+def test_block_validation_rejected():
+    body = {
+        "case": "cross_floor", "floors": 10, "car_count": 2,
+        "capacity": 6, "seed": 5, "rate_per_min": 9, "duration": 600,
+        "until": 1500, "persist": False,
+        "blocks": [{"car": 0, "floor": 99, "start": 0, "end": 10}],
+    }
+    r = client.post("/api/simulate", json=body)
+    assert r.status_code == 400
+    assert "阻挡" in r.json()["detail"]
+
+
+def test_no_blocks_means_no_baseline_payload():
+    body = {
+        "case": "cross_floor", "floors": 10, "car_count": 2,
+        "capacity": 6, "seed": 5, "rate_per_min": 9, "duration": 600,
+        "until": 1500, "persist": False, "policies": ["nearest"],
+    }
+    data = client.post("/api/simulate", json=body).json()
+    assert data["baselines"] == []
+    assert data["deltas"] is None
+    assert "blockages" not in data["results"][0]["metrics"]

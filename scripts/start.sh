@@ -22,7 +22,8 @@ if ! pg_isready -h /tmp -p 5432 >/dev/null 2>&1; then
       >> "$HOME/pgdata/postgresql.conf"
   fi
   "$PGBIN/pg_ctl" -D "$HOME/pgdata" -l "$HOME/pgdata/server.log" -w start
-  "$PGBIN/psql" -h /tmp -U elevator -tc "SELECT 1 FROM pg_database WHERE datname='elevator_lab'" \
+  "$PGBIN/psql" -h /tmp -U elevator -d postgres -tc \
+    "SELECT 1 FROM pg_database WHERE datname='elevator_lab'" \
     | grep -q 1 || "$PGBIN/createdb" -h /tmp -U elevator elevator_lab
 fi
 

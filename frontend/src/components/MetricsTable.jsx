@@ -17,7 +17,7 @@ function Cell({ value, best, bad, suffix }) {
   )
 }
 
-export default function MetricsTable({ comparison, results }) {
+export default function MetricsTable({ comparison, results, blocked }) {
   const best = comparison?.best || {}
   const byPol = Object.fromEntries(results.map(r => [r.policy, r.metrics]))
   return (
@@ -41,7 +41,9 @@ export default function MetricsTable({ comparison, results }) {
             return (
               <tr key={pol}>
                 <td className="pol-name">
-                  <b>{POLICY_META[pol]?.name || pol}</b>
+                  <b>{POLICY_META[pol]?.name || pol}
+                    {blocked && (m.blockages ? <span className="block-badge">阻挡</span> : null)}
+                  </b>
                   <small>{POLICY_META[pol]?.desc}</small>
                 </td>
                 <td>{m.served} / {m.demand}</td>

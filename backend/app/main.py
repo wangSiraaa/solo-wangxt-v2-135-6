@@ -70,6 +70,7 @@ def _resolve_params(req: SimRequest) -> dict:
     if req.case not in SCENARIOS:
         raise HTTPException(400, f"未知案例 {req.case}")
     d = SCENARIO_DEFAULTS[req.case]
+    blocks = [b.model_dump() for b in (req.blocks or [])]
     return {
         "case": req.case,
         "floors": req.floors,
@@ -81,7 +82,23 @@ def _resolve_params(req: SimRequest) -> dict:
         "rate_per_min": req.rate_per_min if req.rate_per_min is not None else d["rate_per_min"],
         "duration": req.duration if req.duration is not None else d["duration"],
         "until": req.until if req.until is not None else d["until"],
+        "blocks": blocks,
+        "compare_baseline": req.compare_baseline,
     }
+
+
+def _scenario_id(p: dict, blocked_variant: bool) -> str:
+    base = (f"{p['case']}_F{p['floors']}C{p['car_count']}"
+            f"_cap{p['capacity']}_ft{p['floor_time']}"
+            f"_dt{p['door_time']}_r{p['rate_per_min']}"
+            f"_d{p['duration']}_s{p['seed']}")
+    if blocked_variant and p["blocks"]:
+        key = json.dumps(
+            sorted(p["blocks"], key=lambda x: (x["car"], x["start"])),
+            sort_keys=True, ensure_ascii=False)
+        import hashlib
+        return f"{base}_blk{hashlib.sha1(key.encode()).hexdigest()[:12]}"
+    return base
 
 
 @app.post("/api/simulate")
@@ -92,22 +109,72 @@ def simulate(req: SimRequest) -> dict:
         if name not in POLICIES:
             raise HTTPException(400, f"未知策略 {name}")
 
-    # 同一客流（到达序列）一次性生成，所有策略复用
+    # 阻挡配置在解析后的建筑参数下校验（楼层/轿厢/时间窗/重叠）
+    from .blockages import normalize_blocks
+    try:
+        norm_blocks = normalize_blocks(
+            p["blocks"], floors=p["floors"],
+            car_count=p["car_count"], until=p["until"])
+    except ValueError as exc:
+        raise HTTPException(400, f"阻挡事件配置非法：{exc}")
+    p["blocks"] = [b.to_dict() for b in norm_blocks]
+
+    # 同一客流（到达序列）一次性生成，所有策略、有/无阻挡全部复用，
+    # 绝不因阻挡对照重新随机生成乘客
     from .demand import build_arrivals
     arrivals = build_arrivals(
         p["case"], floors=p["floors"], seed=p["seed"],
         rate_per_min=p["rate_per_min"], duration=p["duration"])
 
     results: list[dict] = []
+    baselines: list[dict] = []
     persist_ok = bool(req.persist and getattr(app.state, "db_ok", False))
+    want_baseline = bool(p["compare_baseline"] and p["blocks"])
 
     # 场景配置落库（相同参数复用同一 scenario_id）
-    scenario_id = (f"{p['case']}_F{p['floors']}C{p['car_count']}"
-                   f"_cap{p['capacity']}_ft{p['floor_time']}"
-                   f"_dt{p['door_time']}_r{p['rate_per_min']}"
-                   f"_d{p['duration']}_s{p['seed']}")
+    scenario_id = _scenario_id(p, blocked_variant=bool(p["blocks"]))
+    baseline_scenario_id = _scenario_id(p, blocked_variant=False)
     if persist_ok:
-        _upsert_scenario(scenario_id, p, len(arrivals))
+        _upsert_scenario(baseline_scenario_id, p, len(arrivals), [])
+        if p["blocks"]:
+            _upsert_scenario(scenario_id, p, len(arrivals), p["blocks"])
+
+    # 先跑无阻挡对照（同一份 arrivals）
+    baseline_ids: dict[str, int] = {}
+    if want_baseline:
+        for name in policy_names:
+            r = run_simulation(
+                case=p["case"], policy_name=name,
+                floors=p["floors"], car_count=p["car_count"],
+                capacity=p["capacity"], floor_time=p["floor_time"],
+                door_time=p["door_time"], seed=p["seed"],
+                rate_per_min=p["rate_per_min"], duration=p["duration"],
+                until=p["until"], arrivals_override=arrivals,
+                label=f"{p['case']}/{name}/baseline")
+            run_id = None
+            if persist_ok:
+                try:
+                    with Session(db.get_engine()) as session:
+                        run_id = db.save_run(
+                            session, scenario_id=baseline_scenario_id,
+                            policy=name, seed=p["seed"],
+                            metrics=r["metrics"],
+                            verification=r["verification"],
+                            pax_rows=r["passengers"], events=r["events"])
+                except Exception as exc:
+                    r["verification"] = {**r["verification"],
+                                         "persist_error": str(exc)}
+            baseline_ids[name] = run_id
+            baselines.append({
+                "run_id": run_id,
+                "policy": name,
+                "display_name": POLICIES[name]().display_name,
+                "metrics": r["metrics"],
+                "verification": r["verification"],
+                "event_count": len(r["events"]),
+                "events": r["events"],
+                "passengers": r["passengers"],
+            })
 
     for name in policy_names:
         r = run_simulation(
@@ -117,7 +184,8 @@ def simulate(req: SimRequest) -> dict:
             door_time=p["door_time"], seed=p["seed"],
             rate_per_min=p["rate_per_min"], duration=p["duration"],
             until=p["until"], arrivals_override=arrivals,
-            label=f"{p['case']}/{name}")
+            label=f"{p['case']}/{name}",
+            blocks_raw=p["blocks"] if p["blocks"] else None)
         run_id = None
         if persist_ok:
             try:
@@ -126,7 +194,9 @@ def simulate(req: SimRequest) -> dict:
                         session, scenario_id=scenario_id, policy=name,
                         seed=p["seed"], metrics=r["metrics"],
                         verification=r["verification"],
-                        pax_rows=r["passengers"], events=r["events"])
+                        pax_rows=r["passengers"], events=r["events"],
+                        blocks=p["blocks"], blocked=bool(p["blocks"]),
+                        baseline_run_id=baseline_ids.get(name))
             except Exception as exc:
                 r["verification"] = {**r["verification"],
                                      "persist_error": str(exc)}
@@ -139,6 +209,8 @@ def simulate(req: SimRequest) -> dict:
             "event_count": len(r["events"]),
             "events": r["events"],          # 前端直接播放本次结果
             "passengers": r["passengers"],
+            "blocks": r["config"]["blocks"],
+            "baseline_run_id": baseline_ids.get(name),
         })
 
     return {
@@ -149,26 +221,28 @@ def simulate(req: SimRequest) -> dict:
         "demand_n": len(arrivals),
         "persisted": persist_ok,
         "results": results,
+        "baselines": baselines,
         "comparison": _comparison(results),
+        "baseline_comparison": _comparison(baselines) if baselines else None,
+        "deltas": _deltas(baselines, results) if baselines else None,
     }
 
 
-def _upsert_scenario(scenario_id: str, p: dict, demand: int) -> None:
-    try:
-        with Session(db.get_engine()) as session:
-            existing = session.get(db.Scenario, scenario_id)
-            if existing is None:
-                session.add(db.Scenario(
-                    id=scenario_id, case=p["case"],
-                    label=SCENARIO_DEFAULTS[p["case"]]["desc"],
-                    floors=p["floors"], car_count=p["car_count"],
-                    capacity=p["capacity"], floor_time=p["floor_time"],
-                    door_time=p["door_time"], seed=p["seed"],
-                    rate_per_min=p["rate_per_min"], duration=p["duration"],
-                    until=p["until"], demand=demand))
-                session.commit()
-    except Exception:
-        raise
+def _upsert_scenario(scenario_id: str, p: dict, demand: int,
+                     blocks: list | None = None) -> None:
+    with Session(db.get_engine()) as session:
+        existing = session.get(db.Scenario, scenario_id)
+        if existing is None:
+            session.add(db.Scenario(
+                id=scenario_id, case=p["case"],
+                label=SCENARIO_DEFAULTS[p["case"]]["desc"],
+                floors=p["floors"], car_count=p["car_count"],
+                capacity=p["capacity"], floor_time=p["floor_time"],
+                door_time=p["door_time"], seed=p["seed"],
+                rate_per_min=p["rate_per_min"], duration=p["duration"],
+                until=p["until"], demand=demand,
+                blocks_json=json.dumps(blocks or [], ensure_ascii=False)))
+            session.commit()
 
 
 def _comparison(results: list[dict]) -> dict:
@@ -193,6 +267,38 @@ def _comparison(results: list[dict]) -> dict:
     return {"rows": rows, "best": best}
 
 
+def _deltas(baselines: list[dict], blocked: list[dict]) -> dict:
+    """同一客流、同种子：有阻挡 − 无阻挡 的全客流指标变化（不重新生成乘客）。"""
+    base = {r["policy"]: r["metrics"] for r in baselines}
+    rows = {}
+    for r in blocked:
+        m = r["metrics"]
+        bm = base.get(r["policy"])
+        if bm is None:
+            continue
+
+        def diff(blk, base_v):
+            return round(blk - base_v, 3) if blk is not None and base_v is not None else None
+
+        rows[r["policy"]] = {
+            "wait_mean_all_delta": diff(m["all_pax"]["wait_mean"],
+                                        bm["all_pax"]["wait_mean"]),
+            "wait_p90_all_delta": diff(m["all_pax"]["wait_p90"],
+                                       bm["all_pax"]["wait_p90"]),
+            "total_mean_all_delta": diff(m["all_pax"]["total_mean"],
+                                         bm["all_pax"]["total_mean"]),
+            "total_p90_all_delta": diff(m["all_pax"]["total_p90"],
+                                        bm["all_pax"]["total_p90"]),
+            "ride_mean_served_delta": diff(m["served_only"]["ride_mean"],
+                                           bm["served_only"]["ride_mean"]),
+            "served_delta": m["served"] - bm["served"],
+            "unserved_delta": m["unserved"] - bm["unserved"],
+            # 阻挡事件受影响乘客子口径（来自引擎 blockages 汇总）
+            "blockages": m.get("blockages"),
+        }
+    return {"rows": rows}
+
+
 @app.get("/api/runs")
 def list_runs(limit: int = Query(50, le=200)) -> dict:
     if not getattr(app.state, "db_ok", False):
@@ -206,6 +312,9 @@ def list_runs(limit: int = Query(50, le=200)) -> dict:
             "completion_rate": r.completion_rate,
             "wait_mean_all": r.wait_mean_all,
             "total_mean_all": r.total_mean_all,
+            "blocked": r.blocked,
+            "baseline_run_id": r.baseline_run_id,
+            "blocks": json.loads(r.blocks_json or "[]"),
         } for r in runs]}
 
 
@@ -217,15 +326,30 @@ def get_run(run_id: int) -> dict:
         run = session.get(db.Run, run_id)
         if run is None:
             raise HTTPException(404, f"run {run_id} 不存在")
+        scenario = session.get(db.Scenario, run.scenario_id)
         pax = session.execute(
             select(db.Passenger).where(db.Passenger.run_id == run_id)
             .order_by(db.Passenger.pid)).scalars().all()
-        return {
+        blocks = json.loads(run.blocks_json or "[]")
+        payload = {
             "run": {
                 "id": run.id, "scenario_id": run.scenario_id,
                 "policy": run.policy, "seed": run.seed,
+                "blocked": run.blocked,
+                "baseline_run_id": run.baseline_run_id,
+                "blocks": blocks,
                 "metrics": json.loads(run.metrics_json),
                 "verification": json.loads(run.verification_json or "{}"),
+            },
+            "scenario": None if scenario is None else {
+                "id": scenario.id, "case": scenario.case,
+                "floors": scenario.floors, "car_count": scenario.car_count,
+                "capacity": scenario.capacity,
+                "floor_time": scenario.floor_time,
+                "door_time": scenario.door_time,
+                "rate_per_min": scenario.rate_per_min,
+                "duration": scenario.duration, "until": scenario.until,
+                "demand": scenario.demand,
             },
             "passengers": [{
                 "pid": p.pid, "origin": p.origin, "dest": p.dest,
@@ -235,6 +359,15 @@ def get_run(run_id: int) -> dict:
                 "ride_time": p.ride_time, "total_time": p.total_time,
             } for p in pax],
         }
+        # 阻挡运行：附带无阻挡对照的指标与事件，支持直接重放对照
+        if run.baseline_run_id is not None:
+            base = session.get(db.Run, run.baseline_run_id)
+            if base is not None:
+                payload["baseline"] = {
+                    "run_id": base.id, "policy": base.policy,
+                    "metrics": json.loads(base.metrics_json),
+                }
+        return payload
 
 
 @app.get("/api/runs/{run_id}/events")

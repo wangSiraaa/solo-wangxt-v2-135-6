@@ -1,6 +1,7 @@
 """把"客流 + 建筑参数 + 策略"组装成一次仿真并校验。"""
 from __future__ import annotations
 
+from .blockages import normalize_blocks
 from .demand import build_arrivals
 from .engine import Building
 from .models import PaxStatus
@@ -13,7 +14,8 @@ def run_simulation(*, case: str, policy_name: str,
                    floor_time: float, door_time: float,
                    seed: int, rate_per_min: float, duration: float,
                    until: float, label: str = "",
-                   arrivals_override: list | None = None) -> dict:
+                   arrivals_override: list | None = None,
+                   blocks_raw: list | None = None) -> dict:
     if policy_name not in POLICIES:
         raise ValueError(f"未知策略 {policy_name}，可选 {list(POLICIES)}")
 
@@ -24,12 +26,16 @@ def run_simulation(*, case: str, policy_name: str,
             case, floors=floors, seed=seed,
             rate_per_min=rate_per_min, duration=duration)
 
+    blocks = normalize_blocks(blocks_raw, floors=floors,
+                              car_count=car_count, until=until)
+
     policy = POLICIES[policy_name]()
     b = Building(
         floors=floors, car_count=car_count, capacity=capacity,
         floor_time=floor_time, door_time=door_time,
         seed=seed, until=until, policy=policy,
         label=label or f"{case}/{policy_name}",
+        blocks=blocks,
     )
     b.set_arrivals(arrivals)
     metrics = b.run()
@@ -37,17 +43,24 @@ def run_simulation(*, case: str, policy_name: str,
     pax_rows = [_pax_row(p, until) for p in b.pax]
     pax_for_verify = [{"status": p.status} for p in b.pax]
     warnings = verify(b.events, pax_for_verify,
-                      capacity=capacity, floors=floors, until=until)
+                      capacity=capacity, floors=floors, until=until,
+                      blocks=blocks)
+    checks = [
+        "每名乘客任意时刻唯一物理位置(hall/car/outside)",
+        "上下客位置与轿厢楼层一致、方向约束",
+        "轿厢容量上限", "轿厢逐层移动、开门不动",
+        "状态链 arrive→board→alight 无重复/无消失",
+        "日志完成人数与乘客表一致",
+    ]
+    if blocks:
+        checks += [
+            "阻挡期间轿厢不移动、不关门、不重复登乘",
+            "阻挡开始/解除事件与配置窗一一对应，位置不跳变",
+        ]
     verification = {
         "ok": True,
         "warnings": warnings,
-        "checks": [
-            "每名乘客任意时刻唯一物理位置(hall/car/outside)",
-            "上下客位置与轿厢楼层一致、方向约束",
-            "轿厢容量上限", "轿厢逐层移动、开门不动",
-            "状态链 arrive→board→alight 无重复/无消失",
-            "日志完成人数与乘客表一致",
-        ],
+        "checks": checks,
         "final_locations": _final_locations(b),
     }
 
@@ -64,6 +77,7 @@ def run_simulation(*, case: str, policy_name: str,
             "door_time": door_time, "seed": seed,
             "rate_per_min": rate_per_min, "duration": duration,
             "until": until,
+            "blocks": [x.to_dict() for x in blocks],
         },
         "verification": verification,
     }
