@@ -22,7 +22,7 @@ import simpy
 
 from .models import (
     UP, DOWN, IDLE,
-    Pax, PaxStatus, HallCall,
+    Pax, PaxStatus, HallCall, DoorHold,
 )
 
 
@@ -65,7 +65,7 @@ class Building:
                  floor_time: float, door_time: float,
                  parking_floor: int = 1, seed: int = 0,
                  until: float = 3600.0, policy: Policy | None = None,
-                 label: str = ""):
+                 label: str = "", door_hold: dict | None = None):
         self.floors = floors
         self.car_count = car_count
         self.capacity = capacity
@@ -76,6 +76,16 @@ class Building:
         self.until = until
         self.policy: Policy = policy  # type: ignore[assignment]
         self.label = label
+        # 门阻挡事件（可选）：{"floor": f, "start": t, "duration": d}
+        if door_hold is not None:
+            if not (1 <= door_hold["floor"] <= floors):
+                raise ValueError(
+                    f"门阻挡楼层 {door_hold['floor']} 超出井道 1..{floors}")
+            if door_hold["start"] < 0 or door_hold["duration"] <= 0:
+                raise ValueError("门阻挡 start 必须 >= 0 且 duration > 0")
+            self.door_hold: DoorHold | None = DoorHold(**door_hold)
+        else:
+            self.door_hold = None
 
         self.env = simpy.Environment()
         self.cars: list[Car] = []
@@ -255,6 +265,23 @@ class Building:
                 self.log(env.now, "car_full", car=car.id, floor=f,
                          left_waiting=True, queue_len=len(left))
 
+        # ---- 门阻挡事件：窗口内第一台在本层正欲关门的轿厢被乘客挡住 ----
+        # 正常下客/上客已完成；阻挡只推迟关门，等待期间不得移动、不得再次登乘。
+        hold = self.door_hold
+        if (hold is not None and not hold.consumed and f == hold.floor
+                and hold.start <= env.now < hold.end):
+            hold.consumed = True
+            hold.car_id = car.id
+            hold.hold_start = env.now
+            self.log(env.now, "door_hold_start", car=car.id, floor=f,
+                     planned_close=round(env.now, 4), until=hold.end,
+                     load=len(car.aboard))
+            yield env.timeout(hold.end - env.now)
+            hold.released = True
+            self.log(env.now, "door_hold_end", car=car.id, floor=f,
+                     held_for=round(env.now - hold.hold_start, 4),
+                     load=len(car.aboard))
+
         self.log(env.now, "doors_close", car=car.id, floor=f,
                  load=len(car.aboard))
         car.load_profile.append((env.now, len(car.aboard)))
@@ -363,6 +390,7 @@ class Building:
             "served": len(served),
             "unserved": len(unserved),
             "completion_rate": round(completion, 4),
+            "door_hold": self._door_hold_info(),
             # 只对已完成乘客有"物理意义"的条件均值（明确标注口径）
             "served_only": {
                 "wait_mean": round(sum(served_wait) / len(served_wait), 3) if served_wait else None,
@@ -381,3 +409,26 @@ class Building:
             },
             "cars": car_stats,
         }
+
+    def _door_hold_info(self) -> dict | None:
+        """门阻挡事件配置与触发结果（供指标/前端时间轴/持久化复放）。"""
+        h = self.door_hold
+        if h is None:
+            return None
+        info: dict = {
+            "configured": {"floor": h.floor, "start": h.start,
+                           "duration": h.duration},
+            "end": h.end,
+            "triggered": h.consumed,
+        }
+        if h.consumed:
+            info.update({
+                "car": h.car_id,
+                "floor": h.floor,
+                "hold_start": h.hold_start,
+                "hold_end": h.end if h.released else None,
+                "released": h.released,
+                # 额外延误 = 解除时刻 - 本应关门时刻（未解除按截止时刻截断）
+                "delay": round(min(h.end, self.until) - h.hold_start, 4),
+            })
+        return info

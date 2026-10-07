@@ -37,6 +37,27 @@ class Pax:
 
 
 @dataclass
+class DoorHold:
+    """门阻挡事件：乘客在 [start, start+duration) 窗口内挡住指定楼层的门。
+
+    窗口内第一台在该楼层完成正常开关门周期、正欲关门的轿厢被"挡住"：
+    关门推迟到窗口结束。阻挡期间该轿厢不能移动、不能再次登乘；
+    事件只触发一次（一台轿厢），其它轿厢按各自策略照常运行。
+    """
+    floor: int
+    start: float
+    duration: float
+    consumed: bool = False          # 是否已命中某台轿厢（只触发一次）
+    car_id: int | None = None       # 被挡轿厢
+    hold_start: float | None = None  # 实际生效时刻（= 本应关门的时刻）
+    released: bool = False          # 是否已记录解除（仿真截止前解除才算）
+
+    @property
+    def end(self) -> float:
+        return self.start + self.duration
+
+
+@dataclass
 class HallCall:
     """一层、一方向上的候梯队列（FIFO）。
 
